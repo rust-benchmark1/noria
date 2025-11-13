@@ -176,7 +176,22 @@ impl ControllerHandle<consensus::ZookeeperAuthority> {
 // this alias is needed to work around -> impl Trait capturing _all_ lifetimes by default
 // the A parameter is needed so it gets captured into the impl Trait
 #[cfg(not(doc))]
-type RpcFuture<A, R> = impl Future<Output = Result<R, failure::Error>>;
+pub struct RpcFuture<A, R> {
+    inner: std::pin::Pin<Box<dyn Future<Output = Result<R, failure::Error>> + Send>>,
+    _marker: std::marker::PhantomData<A>,
+}
+
+#[cfg(not(doc))]
+impl<A, R> Future for RpcFuture<A, R> {
+    type Output = Result<R, failure::Error>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        // Safety: we never move out of `inner`
+        let inner = unsafe { &mut self.get_unchecked_mut().inner };
+        inner.as_mut().poll(cx)
+    }
+}
+
 #[cfg(doc)]
 type RpcFuture<A, R> = crate::doc_mock::FutureWithExtra<Result<R, failure::Error>, A>;
 
@@ -367,7 +382,10 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     {
         let fut = self.handle.call(ControllerRequest::new(path, r).unwrap());
 
-        finalize(fut, err)
+        RpcFuture {
+            inner: Box::pin(finalize(fut, err)),
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Get statistics about the time spent processing different parts of the graph.

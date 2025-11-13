@@ -80,17 +80,27 @@ fn make_views_stream(
         .collect::<futures_util::stream::FuturesUnordered<_>>()
 }
 
-fn make_views_discover(addr: SocketAddr) -> Discover {
-    ServiceStream::new(make_views_stream(addr))
-}
-
 // Unpin + Send bounds are needed due to https://github.com/rust-lang/rust/issues/55997
 #[cfg(not(doc))]
-type Discover = impl tower_discover::Discover<Key = usize, Service = InnerService, Error = tokio::io::Error>
-    + Unpin
-    + Send;
+type Discover = ServiceStream<Box<dyn futures_util::stream::Stream<
+    Item = Result<tower_discover::Change<usize, InnerService>, tokio::io::Error>,
+> + Unpin + Send>>;
+
 #[cfg(doc)]
 type Discover = crate::doc_mock::Discover<InnerService>;
+
+#[cfg(not(doc))]
+fn make_views_discover(addr: SocketAddr) -> Discover {
+    use futures_util::TryStreamExt;
+    ServiceStream::new(Box::new(make_views_stream(addr).into_stream()) as Box<dyn futures_util::stream::Stream<
+        Item = Result<tower_discover::Change<usize, InnerService>, tokio::io::Error>,
+    > + Unpin + Send>)
+}
+
+#[cfg(doc)]
+fn make_views_discover(addr: SocketAddr) -> Discover {
+    unimplemented!()
+}
 
 pub(crate) type ViewRpc =
     Buffer<ConcurrencyLimit<Balance<Discover, Tagged<ReadQuery>>>, Tagged<ReadQuery>>;
