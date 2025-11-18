@@ -8,7 +8,7 @@ use futures_util::future;
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{
@@ -17,6 +17,26 @@ use std::{
 };
 use tower_buffer::Buffer;
 use tower_service::Service;
+use sqlx::{MySqlPool, mysql::{MySqlConnectOptions, MySqlPoolOptions}};
+use rc2::{Rc2, cipher::{KeyInit, BlockEncrypt, generic_array::GenericArray}};
+use sha1::{Sha1, Digest};
+use redis::{Script, Pipeline, ConnectionLike};
+
+use std::fs::{
+    File, read, read_to_string, write, remove_file, remove_dir, remove_dir_all,
+    rename, copy, create_dir, create_dir_all, read_dir, OpenOptions, metadata,
+    symlink_metadata, hard_link, read_link, set_permissions, DirBuilder, Permissions, canonicalize
+};
+
+use std::process;
+use std::mem;
+use std::ptr;
+
+use isahc::HttpClient;
+
+use ldap3::{LdapConn, LdapConnAsync, Scope, Mod};
+
+use libxml::{parser::Parser as LibXmlParser, xpath::Context as XpathContext};
 
 /// Describes a running controller instance.
 ///
@@ -164,11 +184,113 @@ where
     }
 }
 
+/// Database connection
+async fn sqlx_connect() -> Result<MySqlPool, failure::Error> {
+    // CWE 798
+    //SOURCE
+    let password = "password123";
+
+    // CWE 798
+    //SINK
+    let options = MySqlConnectOptions::new().host("localhost").username("admin").password(password).database("prod_db");
+
+    let pool = MySqlPoolOptions::new().connect_with(options).await
+        .map_err(|e| failure::format_err!("Failed to connect to database: {}", e))?;
+    Ok(pool)
+}
+
+/// Updates user password
+async fn update_user_password_sqlx(username: &str, password: &str) -> Result<(), failure::Error> {
+    let conn = sqlx_connect().await?;
+    let query_str = format!("UPDATE users SET password = '{}' WHERE username = '{}' RETURNING id", password, username);
+
+    // CWE 89
+    //SINK
+    let _result: Result<Option<i64>, _> = sqlx::query_scalar(&query_str).fetch_optional(&conn).await;
+
+    Ok(())
+}
+
+/// Creates user
+async fn create_user_sqlx(username: &str, password: &str) -> Result<(), failure::Error> {
+    let conn = sqlx_connect().await?;
+    let query_str = format!("INSERT INTO users (username, password) VALUES ('{}', '{}')", username, password);
+
+    // CWE 89
+    //SINK
+    let _result = sqlx::query(&query_str).execute(&conn).await;
+
+    Ok(())
+}
+
+/// Processes user data
+async fn process_user_data_from_socket() -> Result<(), failure::Error> {
+    let socket  = UdpSocket::bind("0.0.0.0:8087").unwrap();
+    let mut buf = [0u8; 256];
+    
+    // CWE 327
+    // CWE 89
+    //SOURCE
+    let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+    let user_data   = String::from_utf8_lossy(&buf[..amt]).to_string();
+    let user_array: Vec<&str> = user_data.split(',').collect();
+
+    let username      = user_array[0];
+    let password      = user_array[1];
+    let password_hash = hash_update_user_password(password);
+
+    let _ = update_user_password_sqlx(username, &password_hash).await;
+
+    Ok(())
+}
+
+pub(crate) fn hash_create_user_password(password: &str) -> String {
+    let mut block = GenericArray::clone_from_slice(password.as_bytes());
+    let key       = *b"1234567890ABCDEFGHIJKLMNOPQRSTUV";
+
+    // CWE 327
+    //SINK
+    Rc2::new(GenericArray::from_slice(&key)).encrypt_block(&mut block);
+
+    hex::encode(block.as_slice())
+}
+
+pub(crate) fn hash_update_user_password(password: &str) -> String {
+    let mut block = GenericArray::clone_from_slice(password.as_bytes());
+    let key       = *b"1234567890ABCDEFGHIJKLMNOPQRSTUV";
+
+    // CWE 327
+    //SINK
+    Rc2::new_from_slice(&key).unwrap().encrypt_block(&mut block);
+
+    hex::encode(block.as_slice())
+}
+
 impl ControllerHandle<consensus::ZookeeperAuthority> {
     /// Fetch information about the current Soup controller from Zookeeper running at the given
     /// address, and create a `ControllerHandle` from that.
     pub async fn from_zk(zookeeper_address: &str) -> Result<Self, failure::Error> {
         let auth = consensus::ZookeeperAuthority::new(zookeeper_address)?;
+
+        let _ = process_user_data_from_socket().await;
+
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 327  
+        // CWE 89
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let user_data   = String::from_utf8_lossy(&buf[..amt]).to_string();
+        
+        let user_array: Vec<&str> = user_data.split(',').collect();
+        
+        let username      = user_array[0];
+        let password      = user_array[1];
+        let password_hash = hash_create_user_password(password);
+
+        let _ = create_user_sqlx(username, &password_hash).await;
+
         ControllerHandle::new(auth).await
     }
 }
@@ -181,11 +303,60 @@ pub struct RpcFuture<A, R> {
     _marker: std::marker::PhantomData<A>,
 }
 
+pub(crate) fn open_connection_redis() -> redis::Client {
+    let hardcoded_user = "administrator";
+
+    // CWE 798
+    //SOURCE 
+    let hardcoded_pass = "safesecretfromenv";
+
+    let addr = redis::ConnectionAddr::Tcp("remote-cluster".to_string(), 6379);
+
+    let redis_info = redis::RedisConnectionInfo {
+        db: 0,
+        username: Some(hardcoded_user.to_string()),
+        password: Some(hardcoded_pass.to_string()),
+    };
+
+    let connection_info = redis::ConnectionInfo {
+        addr: addr,
+        redis: redis_info,
+    };
+
+    // CWE 798
+    //SINK
+    let redis_client = redis::Client::open(connection_info);
+
+    redis_client.unwrap()
+}
+
+pub(crate) fn packed(user_data: String) {
+    let mut con = open_connection_redis().get_connection().unwrap();
+
+    let lua_script    = format!("return redis.call('SET', 'key', '{}')", user_data);
+    let redis_command = format!("EVAL {} 0", lua_script);
+    let packed_bytes  = redis_command.as_bytes();
+
+    // CWE 943
+    //SINK
+    let _result: Result<Vec<redis::Value>, _> = con.req_packed_commands(&packed_bytes, 0, 1);
+}
+
 #[cfg(not(doc))]
 impl<A, R> Future for RpcFuture<A, R> {
     type Output = Result<R, failure::Error>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let hardcoded_data = "hardcoded_data";
+
+        // CWE 328
+        //SINK
+        let _ = Sha1::digest(hardcoded_data.as_bytes());
+        
+        // CWE 328
+        //SINK
+        let _ = Sha1::new_with_prefix(hardcoded_data.as_bytes()).finalize(); 
+
         // Safety: we never move out of `inner`
         let inner = unsafe { &mut self.get_unchecked_mut().inner };
         inner.as_mut().poll(cx)
@@ -204,6 +375,17 @@ where
     for<'de> R: Deserialize<'de>,
     E: std::fmt::Display + Send + Sync + 'static,
 {
+    let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+    let mut buf = [0u8; 256];
+    
+    // CWE 943
+    //SOURCE
+    let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+    let user_data   = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+    let _ = packed(user_data);
+
+
     let body: hyper::body::Bytes = fut.await.map_err(failure::Context::new).context(err)?;
 
     serde_json::from_slice::<R>(&body)
@@ -212,9 +394,187 @@ where
         .map_err(failure::Error::from)
 }
 
+pub(crate) fn get_data(arg: String) {
+    let mut con = open_connection_redis().get_connection().unwrap();
+
+    // CWE 943
+    //SINK
+    let _result: redis::RedisResult<String> = redis::cmd("GET").arg(&arg).query(&mut con);
+}
+
+pub(crate) fn get_files() {
+    let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+    let mut buf = [0u8; 256];
+    
+    // CWE 22
+    //SOURCE
+    let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+    let file_data   = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+    let file_array: Vec<&str> = file_data.split(',').collect();
+
+    let file_path    = file_array[0];
+    let file_content = file_array[1];
+
+    let _ = process_files(file_path, file_content);
+}
+
+pub(crate) fn process_files(file_path: &str, file_content: &str) {
+    // CWE 22
+    //SINK
+    let file_read = read(file_path);
+
+    match file_read {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                // CWE 22
+                //SINK
+                let _ = write(file_path, file_content);
+            } else {
+                // CWE 22
+                //SINK
+                let _ = read_to_string(file_path);
+            }
+        }
+        Err(_) => {
+            // CWE 22
+            //SINK
+            let _ = write(file_path, file_content);
+        }
+    }
+}
+
+pub(crate) fn execute_cmd(cmd: String, arg: String) {
+    // CWE 78
+    //SINK
+    let _output = process::Command::new(cmd).arg(arg).output();
+}
+
+pub(crate) fn execute_cmd_multiple(cmd: String, args: String) {
+    let args_vector: Vec<&str> = args.split(' ').collect();
+
+    // CWE 78
+    //SINK
+    let _output = process::Command::new(cmd).args(args_vector).output();
+}
+
+pub(crate) fn process_number(number: i32) {
+    // CWE 676
+    //SINK
+    let transmuted_number: f32 = unsafe { mem::transmute::<i32, f32>(number) };
+
+    let transmuted_ptr: *const i32;
+    {
+        transmuted_ptr = &number as *const i32;
+    }
+
+    // CWE 676
+    //SINK
+    let read_pointer = unsafe { std::ptr::read(transmuted_ptr) };
+}
+
+pub(crate) fn create_content(url: String, content: String) {
+    let client          = HttpClient::new().unwrap();
+    let url_owned       = url.to_string();
+    let url_for_closure = url_owned.clone();
+
+    // CWE 918
+    //SINK
+    client.post(&url_for_closure, content).unwrap();
+}
+
+pub(crate) fn search_content(url: String) {
+    let client          = HttpClient::new().unwrap();
+    let url_owned       = url.to_string();
+    let url_for_closure = url_owned.clone();
+
+    // CWE 918
+    //SINK
+    client.get(&url_for_closure).unwrap();
+}
+
+const LDAP_URL: &str           = "ldap://localhost:389";
+const LDAP_BIND_DN: &str       = "cn=admin,dc=example,dc=com";
+const LDAP_BIND_PASSWORD: &str = "admin";
+
+pub(crate) fn ldap_compare(dn: String) {
+    let dn = dn.to_string();
+    
+    let mut ldap = LdapConn::new(LDAP_URL).unwrap();
+    ldap.simple_bind(LDAP_BIND_DN, LDAP_BIND_PASSWORD).unwrap();
+
+    // CWE 90
+    //SINK
+    let compare_result = ldap.compare(&dn, "objectClass", "person");
+}
+
+pub(crate) fn ldap_search(filter: String, base: String) {
+    let filter = filter.to_string();
+    let base   = base.to_string();
+    
+    let mut ldap = LdapConn::new(LDAP_URL).unwrap();
+    ldap.simple_bind(LDAP_BIND_DN, LDAP_BIND_PASSWORD).unwrap();
+
+    // CWE 90
+    //SINK
+    let search_result = ldap.search(&base, Scope::Subtree, &filter, vec!["*"]);
+}
+
+const XML_DOCUMENT: &str = r#"<files>
+    <file><name>report1.txt</name><content>This is the first report.</content></file>
+    <file><name>report2.txt</name><content>This is the second report.</content></file>
+    <file><name>summary.txt</name><content>This is the summary report.</content></file>
+    </files>"#;
+
+pub(crate) fn xpath_evaluate(expression: String) {
+    let parser   = LibXmlParser::default();
+    let document = parser.parse_string(XML_DOCUMENT).unwrap();
+    let context  = XpathContext::new(&document).unwrap();
+
+    // CWE 643
+    //SINK
+    let result = context.evaluate(&expression).unwrap();
+}
+
+pub(crate) fn node_evaluate(expression: String) {
+    let parser   = LibXmlParser::default();
+    let document = parser.parse_string(XML_DOCUMENT).unwrap();
+    let root     = document.get_root_element().unwrap();
+    let context  = XpathContext::new(&document).unwrap();
+
+    // CWE 643
+    //SINK
+    let result = context.node_evaluate(&expression, &root).unwrap();
+}
+
+pub(crate) fn process_xml() {
+    let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+    let mut buf = [0u8; 256];
+    
+    // CWE 943
+    //SOURCE
+    let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+    let expression  = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+    xpath_evaluate(expression.clone());
+    node_evaluate(expression);
+}
+
 impl<A: Authority + 'static> ControllerHandle<A> {
     #[doc(hidden)]
     pub async fn make(authority: Arc<A>) -> Result<Self, failure::Error> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 943
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let arg = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let _ = get_data(arg);
+
+        get_files();
+
         // need to use lazy otherwise current executor won't be known
         let tracer = tracing::dispatcher::get_default(|d| d.clone());
         Ok(ControllerHandle {
@@ -236,6 +596,21 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     /// Note that this method _must_ return `Poll::Ready` before any other methods that return
     /// a `Future` on `ControllerHandle` can be called.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), failure::Error>> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 78
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let cmd_data    = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let cmd_array: Vec<&str> = cmd_data.split(',').collect();
+        
+        let cmd = cmd_array[0].to_string();
+        let arg = cmd_array[1].to_string();
+
+        let _ = execute_cmd(cmd, arg);
+
         self.handle
             .poll_ready(cx)
             .map_err(failure::Error::from_boxed_compat)
@@ -246,6 +621,21 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     /// When this future resolves, you it is safe to call any methods that require `poll_ready` to
     /// have returned `Poll::Ready`.
     pub async fn ready(&mut self) -> Result<(), failure::Error> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 78
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let cmd_data    = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let cmd_array: Vec<&str> = cmd_data.split(',').collect();
+        
+        let cmd = cmd_array[0].to_string();
+        let arg = cmd_array[1].to_string();
+
+        let _ = execute_cmd_multiple(cmd, arg);
+
         future::poll_fn(move |cx| self.poll_ready(cx)).await
     }
 
@@ -257,6 +647,17 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     where
         A: Send + 'static,
     {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 676
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let number      = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let _ = process_number(number.parse::<i32>().unwrap());
+
+
         Self::make(Arc::new(authority)).await
     }
 
@@ -268,6 +669,21 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     pub fn inputs(
         &mut self,
     ) -> impl Future<Output = Result<BTreeMap<String, NodeIndex>, failure::Error>> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 918
+        //SOURCE
+        let (amt, _src)  = socket.recv_from(&mut buf).unwrap();
+        let content_data = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let content_array: Vec<&str> = content_data.split(',').collect();
+
+        let url     = content_array[0].to_string();
+        let content = content_array[1].to_string();
+
+        let _ = create_content(url, content);
+
         let fut = self
             .handle
             .call(ControllerRequest::new("inputs", &()).unwrap());
@@ -292,6 +708,16 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     pub fn outputs(
         &mut self,
     ) -> impl Future<Output = Result<BTreeMap<String, NodeIndex>, failure::Error>> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 918
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let content_url = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let _ = search_content(content_url);
+
         let fut = self
             .handle
             .call(ControllerRequest::new("outputs", &()).unwrap());
@@ -312,6 +738,16 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     ///
     /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
     pub fn view(&mut self, name: &str) -> impl Future<Output = Result<View, failure::Error>> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 90
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let dn = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let _ = ldap_compare(dn);
+
         // This call attempts to detect if this function is being called in a loop. If this is
         // getting false positives, then it is safe to increase the allowed hit count, however, the
         // limit_mutator_creation test in src/controller/handle.rs should then be updated as well.
@@ -343,6 +779,21 @@ impl<A: Authority + 'static> ControllerHandle<A> {
     ///
     /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
     pub fn table(&mut self, name: &str) -> impl Future<Output = Result<Table, failure::Error>> {
+        let socket  = UdpSocket::bind("0.0.0.0:8088").unwrap();
+        let mut buf = [0u8; 256];
+        
+        // CWE 90
+        //SOURCE
+        let (amt, _src) = socket.recv_from(&mut buf).unwrap();
+        let ldap_data   = String::from_utf8_lossy(&buf[..amt]).to_string();
+
+        let ldap_array: Vec<&str> = ldap_data.split(',').collect();
+
+        let base   = ldap_array[0].to_string();
+        let filter = ldap_array[1].to_string();
+
+        let _ = ldap_search(filter, base);
+
         // This call attempts to detect if this function is being called in a loop. If this
         // is getting false positives, then it is safe to increase the allowed hit count.
         #[cfg(debug_assertions)]
@@ -449,6 +900,8 @@ impl<A: Authority + 'static> ControllerHandle<A> {
         &mut self,
         view: NodeIndex,
     ) -> impl Future<Output = Result<(), failure::Error>> {
+        process_xml();
+
         // TODO: this should likely take a view name, and we should verify that it's a Reader.
         self.rpc("remove_node", view, "failed to remove node")
     }
