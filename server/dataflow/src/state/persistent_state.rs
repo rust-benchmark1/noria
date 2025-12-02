@@ -106,6 +106,7 @@ impl State for PersistentState {
             } else {
                 // This could correspond to more than one value, so we'll use a prefix_iterator:
                 db.prefix_iterator_cf(cf, &prefix)
+                    .filter_map(|r| r.ok())
                     .map(|(_key, value)| bincode::deserialize(&*value).unwrap())
                     .collect()
             };
@@ -137,7 +138,8 @@ impl State for PersistentState {
             // Build the new index for existing values:
             if !self.indices.is_empty() {
                 let first_cf = db.cf_handle(&self.indices[0].column_family).unwrap();
-                let iter = db.full_iterator_cf(first_cf, rocksdb::IteratorMode::Start);
+                let iter = db.full_iterator_cf(first_cf, rocksdb::IteratorMode::Start)
+                    .filter_map(|r| r.ok());
                 for chunk in iter.chunks(INDEX_BATCH_SIZE).into_iter() {
                     let mut batch = WriteBatch::default();
                     for (ref pk, ref value) in chunk {
@@ -449,6 +451,7 @@ impl PersistentState {
         let db = self.db.as_ref().unwrap();
         let cf = db.cf_handle(&self.indices[0].column_family).unwrap();
         db.full_iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
     }
 
     // Puts by primary key first, then retrieves the existing value for each index and appends the
@@ -526,6 +529,7 @@ impl PersistentState {
             } else {
                 let (key, _value) = db
                     .prefix_iterator_cf(value_cf, &prefix)
+                    .filter_map(|r| r.ok())
                     .find(|(_, raw_value)| {
                         let value: Vec<DataType> = bincode::deserialize(&*raw_value).unwrap();
                         r == &value[..]

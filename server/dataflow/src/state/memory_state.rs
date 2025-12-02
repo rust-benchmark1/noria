@@ -155,7 +155,7 @@ impl State for MemoryState {
 
     fn evict_random_keys(&mut self, count: usize) -> (&[usize], Vec<Vec<DataType>>, u64) {
         let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0, self.state.len());
+        let index = rng.gen_range(0..self.state.len());
         let (bytes_freed, keys) = self.state[index].evict_random_keys(count, &mut rng);
         self.mem_size = self.mem_size.saturating_sub(bytes_freed);
         (self.state[index].key(), keys, bytes_freed)

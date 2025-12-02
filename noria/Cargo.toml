@@ -45,6 +45,19 @@ slab = "0.4"
 pin-project = "0.4.17"
 futures-util = "0.3.0"
 mysql_common = "0.22"
+chksum-hash-md5 = "0.0.1"
+sqlx = { version = "0.6", features = [ "runtime-async-std-native-tls", "sqlite", "postgres", "mysql" ] }
+rocket = { version = "0.5", features = ["json"] }
+rocket_cors = "0.6"
+warp = "0.3"
+warp-sessions = "1.0"
+rc2 = "0.8.1"
+hex = "0.4"
+sha1 = "0.10.6"
+redis = "0.24"
+isahc = "1"
+ldap3 = "0.11.5"
+libxml = "=0.3.3"
 
 # consensus/
 slog = "2.4.0"

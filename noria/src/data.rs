@@ -297,7 +297,7 @@ where
 
 impl From<i128> for DataType {
     fn from(s: i128) -> Self {
-        if s >= std::i64::MIN.into() && s <= std::i64::MAX.into() {
+        if s >= std::i64::MIN as i128 && s <= std::i64::MAX as i128 {
             DataType::BigInt(s as i64)
         } else {
             panic!("can't fit {} in a DataType::BigInt", s)

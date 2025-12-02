@@ -230,7 +230,9 @@ impl SingleState {
         let mut bytes_freed = 0;
         let mut keys = Vec::with_capacity(count);
         for _ in 0..count {
-            if let Some((n, key)) = self.state.evict_with_seed(rng.gen()) {
+            use rand::RngCore;
+            let seed = rng.next_u64() as usize;
+            if let Some((n, key)) = self.state.evict_with_seed(seed) {
                 bytes_freed += n;
                 keys.push(key);
             } else {

@@ -1,3 +1,6 @@
+#![feature(impl_trait_in_assoc_type)]
+#![feature(type_alias_impl_trait)]
+
 //! This create contains client bindings for [Noria](https://github.com/mit-pdos/noria).
 //!
 //! # What is Noria?
@@ -102,7 +105,6 @@
 //! Noria provides a [MySQL adapter](https://github.com/mit-pdos/noria-mysql) that implements the
 //! binary MySQL protocol, which provides a compatibility layer for applications that wish to
 //! continue to issue ad-hoc MySQL queries through existing MySQL client libraries.
-#![feature(type_alias_impl_trait)]
 #![deny(missing_docs)]
 #![deny(unused_extern_crates)]
 #![deny(unreachable_pub)]
@@ -200,9 +202,13 @@ pub(crate) const VIEW_POOL_SIZE: usize = 16;
 /// batch less work, which means lower overall efficiency.
 pub(crate) const PENDING_LIMIT: usize = 8192;
 
+use chksum_hash_md5;
+
 use petgraph::graph::NodeIndex;
 use std::collections::HashMap;
 use tokio_tower::multiplex;
+
+type Result<T> = std::result::Result<T, failure::Error>;
 
 mod controller;
 mod data;
@@ -237,6 +243,9 @@ pub mod prelude {
     pub use super::Table;
     pub use super::View;
 }
+
+pub mod rocket_api;
+pub mod warp_api;
 
 /// Wrapper types for Noria query results.
 pub mod results {
@@ -273,6 +282,20 @@ impl<Request, Response> multiplex::TagStore<Tagged<Request>, Tagged<Response>> f
     type Tag = u32;
 
     fn assign_tag(mut self: Pin<&mut Self>, r: &mut Tagged<Request>) -> Self::Tag {
+        // CWE 328
+        //SOURCE
+        let hardcoded_data = "hardcoded_data";
+
+        // CWE 328
+        //SINK
+        let mut hasher = chksum_hash_md5::new();
+        hasher.update(hardcoded_data.as_bytes());
+        let _hash = hasher.finalize();
+
+        // CWE 328
+        //SINK
+        let _hashed_data = chksum_hash_md5::hash(hardcoded_data);
+
         r.tag = self.0.insert(()) as u32;
         r.tag
     }
@@ -349,4 +372,22 @@ pub fn shard_by(dt: &DataType, shards: usize) -> usize {
             unimplemented!("asked to shard on value {:?}", x);
         }
     }
+}
+
+/// Initialize Rocket API server
+pub fn init_api_server() {
+    std::thread::spawn(|| {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rocket_api::launch_api());
+    });
+}
+
+/// Initialize Warp API server
+pub fn init_warp_api_server() {
+    std::thread::spawn(|| {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(warp_api::launch_api());
+    });
 }
